@@ -95,7 +95,8 @@ jobs:
         run: |
           cd tdesktop/Telegram/build/docker/centos_env
           poetry install
-          DEBUG= LTO= poetry run gen_dockerfile > Dockerfile
+          DEBUG= LTO= poetry run gen_dockerfile > Dockerfile.generated
+          mv Dockerfile.generated Dockerfile
           rm -rf __pycache__
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
