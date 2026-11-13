@@ -71,7 +71,7 @@ jobs:
     runs-on: ${{ vars.FORKTOP_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 180
     env:
-      CCACHE_DIR: ${{ runner.temp }}/.forktop-ccache
+      CCACHE_DIR: ${{ github.workspace }}/.forktop-ccache
       FORKTOP_API_ID: ${{ secrets.FORKTOP_API_ID }}
       FORKTOP_API_HASH: ${{ secrets.FORKTOP_API_HASH }}
     steps:

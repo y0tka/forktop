@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: 180
     env:
       IMAGE_TAG: tdesktop:centos_env
-      CCACHE_DIR: ${{ runner.temp }}/.forktop-ccache
+      CCACHE_DIR: ${{ github.workspace }}/.forktop-ccache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
