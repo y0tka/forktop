@@ -1,0 +1,253 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (for example v1.2.12-fork.1)
+        required: true
+      dry_run:
+        description: Build and upload artifacts without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  DRY_RUN: ${{ github.event.inputs.dry_run == 'true' }}
+  IMAGE_TAG: tdesktop:centos_env
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FORKTOP_API_ID: ${{ secrets.FORKTOP_API_ID }}
+      FORKTOP_API_HASH: ${{ secrets.FORKTOP_API_HASH }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install stgit
+        run: |
+          curl -sSL -o /tmp/stgit.deb https://github.com/stacked-git/stgit/releases/download/v2.7.0/stgit_2.7.0-1_amd64.deb
+          sudo dpkg -i /tmp/stgit.deb
+      - name: Require release credentials
+        if: env.DRY_RUN != 'true'
+        run: |
+          test -n "$FORKTOP_API_ID" || (echo "::error::FORKTOP_API_ID is not set" && exit 1)
+          test -n "$FORKTOP_API_HASH" || (echo "::error::FORKTOP_API_HASH is not set" && exit 1)
+      - name: Unit tests
+        run: python -m unittest discover -s scripts/tests -t scripts -v
+      - name: Setup exported checkout
+        run: python scripts/patchset.py setup --ci --no-submodules
+      - name: Check
+        run: python scripts/patchset.py check
+      - name: Check changelog
+        run: python scripts/patchset.py changelog --tag "$TAG" --check
+      - name: Check tag prefix
+        run: |
+          prefix="$(cat upstream-tag)-fork."
+          case "$TAG" in
+            "$prefix"*) ;;
+            *) echo "::error::tag $TAG does not start with $prefix"; exit 1 ;;
+          esac
+
+  linux:
+    name: linux
+    needs: validate
+    runs-on: ${{ vars.FORKTOP_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 180
+    env:
+      CCACHE_DIR: ${{ runner.temp }}/.forktop-ccache
+      FORKTOP_API_ID: ${{ secrets.FORKTOP_API_ID }}
+      FORKTOP_API_HASH: ${{ secrets.FORKTOP_API_HASH }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup exported checkout with submodules
+        run: python scripts/patchset.py setup --ci
+      - name: Install Poetry and ccache
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-glibc.tar.xz \
+            | sudo tar xJ -C /usr/local/bin --strip-components=1 ccache-4.13.6-linux-x86_64-glibc/ccache
+          mkdir -p "$CCACHE_DIR"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+      - name: Generate Dockerfile
+        run: |
+          cd tdesktop/Telegram/build/docker/centos_env
+          poetry install
+          DEBUG= LTO= poetry run gen_dockerfile > Dockerfile
+          rm -rf __pycache__
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Libraries cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/.buildx-cache
+            ${{ runner.temp }}/.mount-cache
+          key: ${{ runner.os }}-libs-${{ hashFiles('tdesktop/Telegram/build/docker/centos_env/**') }}
+          restore-keys: ${{ runner.os }}-libs-
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: tdesktop/Telegram/build/docker/centos_env
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=${{ runner.temp }}/.buildx-cache
+          cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
+      - name: Move cache
+        run: |
+          rm -rf "${{ runner.temp }}/.buildx-cache"
+          mv "${{ runner.temp }}/.buildx-cache-new" "${{ runner.temp }}/.buildx-cache"
+      - name: Build Release
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            API="-D TDESKTOP_API_TEST=ON"
+          else
+            API="-D TDESKTOP_API_ID=$FORKTOP_API_ID -D TDESKTOP_API_HASH=$FORKTOP_API_HASH"
+          fi
+          docker run --rm -u "$(id -u)" \
+            -v "$PWD/tdesktop:/usr/src/tdesktop" \
+            -v "$CCACHE_DIR:/var/cache/ccache" \
+            -e CONFIG=Release -e CCACHE_SLOPPINESS=pch_defines,time_macros \
+            "$IMAGE_TAG" env -u CCACHE_DISABLE \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D CMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON \
+            $API
+      - name: Package
+        run: |
+          cd tdesktop/out/Release
+          files=(Telegram)
+          if [ -f Updater ]; then files+=(Updater); fi
+          tar -cJf "$GITHUB_WORKSPACE/forktop-${TAG}-linux-x64.tar.xz" "${files[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forktop-${{ env.TAG }}-linux-x64
+          path: forktop-${{ env.TAG }}-linux-x64.tar.xz
+          retention-days: 14
+
+  windows:
+    name: windows
+    needs: validate
+    runs-on: ${{ vars.FORKTOP_WINDOWS_RUNNER || 'windows-latest' }}
+    timeout-minutes: 360
+    env:
+      FORKTOP_API_ID: ${{ secrets.FORKTOP_API_ID }}
+      FORKTOP_API_HASH: ${{ secrets.FORKTOP_API_HASH }}
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup exported checkout with submodules
+        shell: bash
+        run: python scripts/patchset.py setup --ci
+      - name: Prepare directories
+        run: |
+          if "%DRY_RUN%"=="true" goto :credentials_ok
+          if "%FORKTOP_API_ID%"=="" (echo ::error::FORKTOP_API_ID is not set & exit /b 1)
+          if "%FORKTOP_API_HASH%"=="" (echo ::error::FORKTOP_API_HASH is not set & exit /b 1)
+          :credentials_ok
+          mkdir "%USERPROFILE%\TBuild\Libraries"
+          echo TBUILD=%USERPROFILE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%USERPROFILE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+      - name: Native Tools Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Libraries
+        run: |
+          cd tdesktop
+          call Telegram\build\prepare\win.bat skip-release silent
+          if errorlevel 1 exit /b 1
+      - name: Build Release
+        run: |
+          cd tdesktop\Telegram
+          set API=-D TDESKTOP_API_TEST=ON
+          if not "%DRY_RUN%"=="true" set API=-D TDESKTOP_API_ID=%FORKTOP_API_ID% -D TDESKTOP_API_HASH=%FORKTOP_API_HASH%
+          call configure.bat x64 -D CMAKE_CONFIGURATION_TYPES=Release -D CMAKE_COMPILE_WARNING_AS_ERROR=ON -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON %API%
+          if errorlevel 1 exit /b 1
+          cmake --build ..\out --config Release --parallel
+          if errorlevel 1 exit /b 1
+      - name: Package
+        shell: pwsh
+        run: |
+          Set-Location tdesktop\out\Release
+          $files = @('Telegram.exe', 'Updater.exe') | Where-Object { Test-Path $_ }
+          Compress-Archive -Path $files -DestinationPath "$env:GITHUB_WORKSPACE\forktop-$env:TAG-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forktop-${{ env.TAG }}-windows-x64
+          path: forktop-${{ env.TAG }}-windows-x64.zip
+          retention-days: 14
+
+  publish:
+    name: publish
+    needs: [validate, linux, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: forktop-*
+          merge-multiple: true
+      - name: List artifacts
+        run: find dist -type f -maxdepth 1 -print
+      - name: Dry run
+        if: env.DRY_RUN == 'true'
+        run: echo "dry run; not publishing"
+      - name: Release notes
+        if: env.DRY_RUN != 'true'
+        run: |
+          python scripts/patchset.py changelog --tag "$TAG" > release-notes.md
+      - name: Publish
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --notes-file release-notes.md --title "$TAG"
+          fi

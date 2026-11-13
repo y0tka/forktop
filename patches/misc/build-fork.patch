@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ytk
+Date: Fri, 13 Nov 2026 04:54:02 +0000
+Subject: Build fork-owned sources from SourceFiles/fork
+
+---
+ Telegram/CMakeLists.txt | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index 0000000..0000000 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -3127,3 +3127,11 @@ if (LINUX AND DESKTOP_APP_USE_PACKAGED)
+     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/io.github.tdesktop_x64.TDesktop.service" DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/dbus-1/services")
+     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/io.github.tdesktop_x64.TDesktop.metainfo.xml" DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/metainfo")
+ endif()
++
++file(GLOB_RECURSE fork_sources CONFIGURE_DEPENDS
++    "${src_loc}/fork/*.cpp"
++    "${src_loc}/fork/*.h")
++if (fork_sources)
++    target_sources(Telegram PRIVATE ${fork_sources})
++endif()
++include("${src_loc}/fork/fork.cmake" OPTIONAL)

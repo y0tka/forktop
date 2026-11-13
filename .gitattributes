@@ -1,0 +1,6 @@
+* text=auto
+patches/** text eol=lf
+series text eol=lf
+upstream-commit text eol=lf
+upstream-tag text eol=lf
+scripts/lint-ignore.txt text eol=lf

@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install stgit
+        run: |
+          curl -sSL -o /tmp/stgit.deb https://github.com/stacked-git/stgit/releases/download/v2.7.0/stgit_2.7.0-1_amd64.deb
+          sudo dpkg -i /tmp/stgit.deb
+      - name: Unit tests
+        run: python -m unittest discover -s scripts/tests -t scripts -v
+
+  patchset:
+    name: patchset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install stgit
+        run: |
+          curl -sSL -o /tmp/stgit.deb https://github.com/stacked-git/stgit/releases/download/v2.7.0/stgit_2.7.0-1_amd64.deb
+          sudo dpkg -i /tmp/stgit.deb
+      - name: Setup exported checkout
+        run: python scripts/patchset.py setup --ci --no-submodules
+      - name: Check
+        run: python scripts/patchset.py check
+
+  linux-debug:
+    name: linux-debug
+    needs: patchset
+    runs-on: ${{ vars.FORKTOP_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 180
+    env:
+      IMAGE_TAG: tdesktop:centos_env
+      CCACHE_DIR: ${{ runner.temp }}/.forktop-ccache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup exported checkout with submodules
+        run: python scripts/patchset.py setup --ci
+      - name: Install Poetry and ccache
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -sSL https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-glibc.tar.xz \
+            | sudo tar xJ -C /usr/local/bin --strip-components=1 ccache-4.13.6-linux-x86_64-glibc/ccache
+          mkdir -p "$CCACHE_DIR"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+      - name: Generate Dockerfile
+        run: |
+          cd tdesktop/Telegram/build/docker/centos_env
+          poetry install
+          DEBUG= LTO= poetry run gen_dockerfile > Dockerfile
+          rm -rf __pycache__
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Libraries cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/.buildx-cache
+            ${{ runner.temp }}/.mount-cache
+          key: ${{ runner.os }}-libs-${{ hashFiles('tdesktop/Telegram/build/docker/centos_env/**') }}
+          restore-keys: ${{ runner.os }}-libs-
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: tdesktop/Telegram/build/docker/centos_env
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=${{ runner.temp }}/.buildx-cache
+          cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
+      - name: Move cache
+        run: |
+          rm -rf "${{ runner.temp }}/.buildx-cache"
+          mv "${{ runner.temp }}/.buildx-cache-new" "${{ runner.temp }}/.buildx-cache"
+      - name: Build Debug
+        run: |
+          docker run --rm -u "$(id -u)" \
+            -v "$PWD/tdesktop:/usr/src/tdesktop" \
+            -v "$CCACHE_DIR:/var/cache/ccache" \
+            -e CONFIG=Debug -e CCACHE_SLOPPINESS=pch_defines,time_macros \
+            "$IMAGE_TAG" env -u CCACHE_DISABLE \
+            /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Debug \
+            -D CMAKE_C_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+            -D CMAKE_CXX_FLAGS_DEBUG="-O0 -fpch-preprocess" \
+            -D CMAKE_COMPILE_WARNING_AS_ERROR=ON \
+            -D TDESKTOP_API_TEST=ON \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=OFF \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF
+      - name: Verify binary
+        run: test -f tdesktop/out/Debug/Telegram
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forktop-linux-debug
+          path: tdesktop/out/Debug/Telegram
+          retention-days: 7
